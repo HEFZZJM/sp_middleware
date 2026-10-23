@@ -133,6 +133,7 @@ void RM_Motor::read(uint8_t * data, uint32_t stamp_ms)
   // 更新公有属性
   this->angle = multi_circle_ ? angle_rad + circle_ * 2 * SP_PI / ratio_ : angle_rad;
   this->speed = float(speed_rpm) / 60 * 2 * SP_PI / ratio_;
+  this->speed_rpm = float(speed_rpm);
   this->torque = float(current_raw) * get_raw_to_torque(motor_type_) * ratio_;
   this->temperature = data[6];
 }

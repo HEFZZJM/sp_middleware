@@ -33,6 +33,7 @@ public:
 
   float angle;          // 只读! 单位: rad
   float speed;          // 只读! 单位: rad/s
+  float speed_rpm;      // 只读! 单位: r/min, 转子转速 (CAN 帧里的原值, 和 RM 上位机一致)
   float torque;         // 只读! 单位: N·m
   uint8_t temperature;  // 只读! 单位: 摄氏度
 
