@@ -8,21 +8,16 @@
 
 template <typename MotorType>
 JointMotorController<MotorType>::JointMotorController(
-  float mid, float min, float max, float min_m, float max_m, float max_v, bool reverse,
-  MotorType & motor, sp::PID & pid, sp::PID & motor_speed_pid, bool feedforward, bool limited,
-  float pos_filter, float vel_filter)
-: mid_(mid),
-  min_(min),
+  float min, float max, float max_v, bool reverse, MotorType & motor, sp::PID & pid,
+  sp::PID & motor_speed_pid, bool feedforward, float pos_filter, float vel_filter)
+: min_(min),
   max_(max),
-  min_m_(min_m),
-  max_m_(max_m),
   max_v_(max_v),
   sign_(reverse ? -1.0f : 1.0f),
   motor_(motor),
   pid_(pid),
   motor_speed_pid_(motor_speed_pid),
   feedforward_(feedforward),
-  limited_(limited),
   pos_filter_(pos_filter),
   vel_filter_(vel_filter)
 {
@@ -38,9 +33,11 @@ void JointMotorController<MotorType>::disable()
 }
 
 template <typename MotorType>
-void JointMotorController<MotorType>::init()
+void JointMotorController<MotorType>::init(float zero)
 {
-  init_angle_ = motor_.angle;
+  // pos = sign_ * (motor.angle - init_angle_), zero 就是"读到这里算 0 rad"的那个读数.
+  // 纯算术: 不读 motor_, 和当前姿态无关, 上电前/没收到反馈时调用都行。
+  init_angle_ = zero;
 }
 
 template <typename MotorType>
@@ -164,11 +161,16 @@ void JointMotorController<MotorType>::set_feedforward(float value)
 template <typename MotorType>
 void JointMotorController<MotorType>::control()
 {
-  this->pos = sign_ * motor_.angle - mid_ - init_angle_;
-  if (limited_) {
-    if (this->pos > max_m_) this->pos -= 2 * sp::SP_PI;
-    if (this->pos < min_m_) this->pos += 2 * sp::SP_PI;
-  }
+  // init_angle_ 和 raw 是同一个坐标 (电机的直接读数), 这里只是把它减掉再翻方向.
+  //
+  // 差值要折回 (-π, π]: 达妙 MIT 模式下反馈的 pos 是折到 ±PMAX 的绝对值, 零点一旦
+  // 靠近 ±PMAX (LF 的零点离 π 只有 0.12 rad), 摇臂往正向走就会过圈, 读数从 +π
+  // 跳到 -π; 上电时若已经过圈, 固件根本看不到跨越, 直接算减就整整差一圈.
+  // 摇臂行程 (-20°..100°) 远小于一圈, 折圈不会和真实姿态冲突.
+  float delta = sign_ * (motor_.angle - init_angle_);
+  while (delta > sp::SP_PI) delta -= 2.0f * sp::SP_PI;
+  while (delta <= -sp::SP_PI) delta += 2.0f * sp::SP_PI;
+  this->pos = delta;
   motor_pos_filter_.update(this->pos);
   this->pos_filtered = motor_pos_filter_.out;
   
