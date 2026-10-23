@@ -23,8 +23,12 @@ uint32_t plot_lock()
 void plot_unlock(uint32_t primask) { __set_PRIMASK(primask); }
 }  // namespace
 
-SuperPlotter::SuperPlotter(UART_HandleTypeDef * huart, bool use_dma)
-: huart_(huart), use_dma_(use_dma)
+SuperPlotter::SuperPlotter(
+  UART_HandleTypeDef * huart, bool use_dma, uint32_t period_ms, uint32_t matrix_period_ms)
+: huart_(huart),
+  use_dma_(use_dma),
+  period_ms_(period_ms == 0 ? PLOT_PERIOD_MS : period_ms),
+  matrix_period_ms_(matrix_period_ms == 0 ? PLOT_MATRIX_PERIOD_MS : matrix_period_ms)
 {
   table_.set_lock(&plot_lock, &plot_unlock);
   g_instance = this;
@@ -124,7 +128,7 @@ void SuperPlotter::flush()
   // flush's frame and the scalars wait one tick; a matrix frame is much larger
   // than a scalar frame, so mixing the two would need a bigger tx buffer.
   const uint32_t now = osKernelSysTick();
-  if (now - last_matrix_ms_ >= PLOT_MATRIX_PERIOD_MS) {
+  if (now - last_matrix_ms_ >= matrix_period_ms_) {
     const size_t packed = table_.pop_matrix_sample(tx_, PLOT_TX_SIZE);
     if (packed > 0) {
       last_matrix_ms_ = now;
@@ -162,8 +166,8 @@ void SuperPlotter::loop(TickFn record_hook)
     }
 
     // Plotter self-diagnostics: together they say whether a missing curve is
-    // the link losing frames (tx_fail), the wire being saturated (tx_us vs
-    // PLOT_PERIOD_MS) or the loop itself falling behind (loop).
+    // the link losing frames (tx_fail), the wire being saturated (tx_us vs the
+    // loop tick) or the loop itself falling behind (loop).
     record_runtime("pl/tx_fail", static_cast<float>(tx_fail_));
     record_runtime("pl/tx_us", static_cast<float>(last_tx_us_));
     record_runtime("pl/tx_max", static_cast<float>(max_tx_us_));
@@ -171,7 +175,7 @@ void SuperPlotter::loop(TickFn record_hook)
 
     if (record_hook != nullptr) record_hook();
     flush();
-    osDelayUntil(&wake, PLOT_PERIOD_MS);
+    osDelayUntil(&wake, period_ms_);
   }
 }
 

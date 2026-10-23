@@ -17,12 +17,16 @@ static_assert(PLOT_MAX_TOPICS <= PLOT_MAX_ID, "topic id is one byte on the wire"
 
 // Sampling period of loop(), in milliseconds. Transmit is interrupt driven, so
 // this is the sample grid rather than the time a frame spends on the wire.
+// This is only the default: the constructor takes the period so a task can run
+// slower when the subscribed set does not fit the link (60 topics at 1 kHz need
+// ~300 KB/s, while 921600 baud carries ~92 KB/s).
 constexpr uint32_t PLOT_PERIOD_MS = 1;
 
 // Matrices are much heavier than scalars (a 3x1 costs 5 bytes as scalars, 19
 // bytes as one matrix frame, and a 4x4 costs 71), so they are sent on a slower
 // grid. 10 ms keeps a couple of small matrices well inside a 921600 baud link
-// while still looking continuous on the dashboard.
+// while still looking continuous on the dashboard. Like PLOT_PERIOD_MS this is
+// only the default; the constructor takes it.
 constexpr uint32_t PLOT_MATRIX_PERIOD_MS = 10;
 
 // Named-topic plotter with host-controlled subscriptions.
@@ -57,9 +61,24 @@ constexpr uint32_t PLOT_MATRIX_PERIOD_MS = 10;
 class SuperPlotter
 {
 public:
-  SuperPlotter(UART_HandleTypeDef * huart, bool use_dma = true);
+  // period_ms is the loop() tick: the sample grid, and how often at most one
+  // frame is handed to the UART. 1 keeps the original 1 kHz; a larger value
+  // trades resolution for link headroom. Zero is treated as PLOT_PERIOD_MS.
+  //
+  // matrix_period_ms is the grid matrix frames go out on, independent of the
+  // scalar samples: a matrix frame is much larger, so it would not fit the same
+  // cadence. Zero is treated as PLOT_MATRIX_PERIOD_MS.
+  SuperPlotter(
+    UART_HandleTypeDef * huart, bool use_dma = true, uint32_t period_ms = PLOT_PERIOD_MS,
+    uint32_t matrix_period_ms = PLOT_MATRIX_PERIOD_MS);
 
   UART_HandleTypeDef * huart() const { return huart_; }
+
+  /** Loop tick in milliseconds. */
+  uint32_t period_ms() const { return period_ms_; }
+
+  /** Matrix transmit grid in milliseconds. */
+  uint32_t matrix_period_ms() const { return matrix_period_ms_; }
 
   // Records a value, registering the topic the first time the name is seen.
   // Forwards to the instance created in plot_task.cpp, so nothing needs to be
@@ -157,7 +176,7 @@ public:
   }
 
   // Same for matrices. Call after initialize(); the table is sampled every
-  // PLOT_MATRIX_PERIOD_MS from loop().
+  // tick from loop(), and flush() sends a matrix frame every matrix_period_ms.
   //
   //   super_plotter.initialize_matrices(matrix_rows());
   template <size_t N>
@@ -175,9 +194,10 @@ public:
   // that only samples the polled table just calls loop().
   using TickFn = void (*)();
 
-  // Runs forever on a PLOT_PERIOD_MS grid: samples the polled table, calls
-  // record_hook, then hands at most one frame to the UART. Never returns; a
-  // task that only plots is just initialize() + loop().
+  // Runs forever on a period_ms grid (PLOT_PERIOD_MS unless the constructor
+  // was given another): samples the polled table, calls record_hook, then hands
+  // at most one frame to the UART. Never returns; a task that only plots is
+  // just initialize() + loop().
   void loop(TickFn record_hook = nullptr);
 
   void poll();
@@ -204,6 +224,10 @@ public:
 private:
   UART_HandleTypeDef * huart_;
   bool use_dma_;
+  // Loop tick in ms. Never zero: the constructor substitutes PLOT_PERIOD_MS.
+  uint32_t period_ms_;
+  // Matrix transmit grid in ms. Never zero: same treatment.
+  uint32_t matrix_period_ms_;
   TopicTable table_;
   // Polled table handed to initialize(), sampled by loop().
   PolledRow * rows_ = nullptr;
