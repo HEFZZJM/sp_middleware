@@ -221,6 +221,12 @@ public:
   uint32_t last_tx_us() const { return last_tx_us_; }
   uint32_t max_tx_us() const { return max_tx_us_; }
 
+  // Milliseconds since the last frame completed, and the longest such gap since
+  // boot. Same numbers as pl/tx_age / pl/tx_age_max, for reading under a
+  // debugger without the link up.
+  uint32_t tx_age_ms() const { return HAL_GetTick() - tx_done_ms_; }
+  uint32_t max_tx_age_ms() const { return max_tx_age_ms_; }
+
 private:
   UART_HandleTypeDef * huart_;
   bool use_dma_;
@@ -250,6 +256,11 @@ private:
   volatile uint32_t tx_fail_ = 0;
   volatile uint32_t last_tx_us_ = 0;
   volatile uint32_t max_tx_us_ = 0;
+  // Tick at which the last frame completed, and the longest gap since boot.
+  // Reported as pl/tx_age / pl/tx_age_max (ms): how long the plot loop has been
+  // unable to get a frame out.
+  volatile uint32_t tx_done_ms_ = 0;
+  volatile uint32_t max_tx_age_ms_ = 0;
 
   void write(const char * name, float value, PlotUnit unit);
   bool send_bytes(const uint8_t * data, uint16_t size);

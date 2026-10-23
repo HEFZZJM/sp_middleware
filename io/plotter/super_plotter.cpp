@@ -36,6 +36,9 @@ SuperPlotter::SuperPlotter(
   // slow UART from a starved task when the frame rate is wrong.
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  // Start the "time since the last frame" clock at the constructor rather than
+  // at zero, otherwise the first samples would report the whole uptime.
+  tx_done_ms_ = HAL_GetTick();
 }
 
 void SuperPlotter::record_runtime(const char * name, float value, PlotUnit unit)
@@ -172,6 +175,31 @@ void SuperPlotter::loop(TickFn record_hook)
     record_runtime("pl/tx_us", static_cast<float>(last_tx_us_));
     record_runtime("pl/tx_max", static_cast<float>(max_tx_us_));
     record_runtime("pl/loop", static_cast<float>(iterations & 0xFFFFFFu));
+    // Registered slots and how many of them the host asked for. The two
+    // together turn "the curve stopped" into a diagnosis: `pl/topics` stuck at
+    // PLOT_MAX_TOPICS means insert() silently dropped the rest (RAM/id limit),
+    // while `pl/subs` climbing past what the wire can carry shows up as each
+    // topic updating slower (kSampleBurst values per frame, one frame per tick).
+    record_runtime("pl/topics", static_cast<float>(table_.size()));
+    record_runtime("pl/subs", static_cast<float>(table_.subscribed_count()));
+
+    // Time since the last frame actually left the wire, in ms. This is the
+    // direct measure of "the plot task was not serviced": at period_ms = 1 it
+    // sits at 0..1, and every stall shows up as a spike of exactly the length
+    // of the stall. pl/tx_age_max keeps the worst one since boot, so a gap that
+    // already passed is still visible afterwards.
+    //
+    // Reading it: a spike with pl/tx_fail flat is the task being starved (CPU,
+    // not the link); a spike with pl/tx_fail climbing is a frame that never
+    // completed and had to be dropped. If both stay at 0 and the dashboard
+    // still stutters, the plotter is not the one losing the frames.
+    //
+    // Resolution is the 1 ms HAL tick, so sub-millisecond detail is the same
+    // 0/1 as the sample period; it is sized for stalls, not for jitter.
+    const uint32_t age_ms = HAL_GetTick() - tx_done_ms_;
+    if (age_ms > max_tx_age_ms_) max_tx_age_ms_ = age_ms;
+    record_runtime("pl/tx_age", static_cast<float>(age_ms), PlotUnit::Millisecond);
+    record_runtime("pl/tx_age_max", static_cast<float>(max_tx_age_ms_), PlotUnit::Millisecond);
 
     if (record_hook != nullptr) record_hook();
     flush();
@@ -229,6 +257,10 @@ void SuperPlotter::on_tx_complete()
     const uint32_t cycles = DWT->CYCCNT - tx_start_cycles_;
     last_tx_us_ = cycles / (SystemCoreClock / 1000000u);
     if (last_tx_us_ > max_tx_us_) max_tx_us_ = last_tx_us_;
+    // Timestamp for pl/tx_age. HAL_GetTick() only reads the SysTick counter, so
+    // it is safe here in the completion interrupt, and it does not wrap for
+    // 49 days -- the DWT cycle counter it could have used wraps in 8.9 s.
+    tx_done_ms_ = HAL_GetTick();
     // Announcements are only marked sent now that the bytes are actually out:
     // a frame that is aborted or half sent is retried instead of leaving the
     // host with a torn name.
