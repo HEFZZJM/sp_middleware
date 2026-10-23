@@ -78,8 +78,16 @@ public:
   DBusKeysData keys;    // 只读!
   uint16_t keyboard_value;  // 只读! 键盘16位原始值
 
+  // 排查收不到遥控器用: events 涨 = UART 上有字节进来过, frames 不涨 = 字节到了但
+  // 长度/内容不对 (波特率、校验、反相、解析都会卡在这里), errors 涨 = 帧错误/溢出.
+  uint32_t rx_events = 0;  // 只读! 收到 RxEvent 的次数 (含长度不对的)
+  uint32_t rx_frames = 0;  // 只读! 长度和内容都通过、真正更新了数据的帧数
+  uint32_t rx_errors = 0;  // 只读! UART 错误中断次数
+  uint16_t last_size = 0;  // 只读! 最近一次 RxEvent 的字节数
+
   void request();
   void update(uint16_t size, uint32_t stamp_ms);
+  void on_error();  // UART 错误回调里调, 只计数
 
   bool is_open() const;
   bool is_alive(uint32_t now_ms) const;

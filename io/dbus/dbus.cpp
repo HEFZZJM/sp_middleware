@@ -17,7 +17,16 @@ static DBusSwitchMode get_switch(uint8_t raw)
 }
 
 DBus::DBus(UART_HandleTypeDef * huart, bool use_dma)
-: huart_(huart), use_dma_(use_dma), has_read_(false)
+: ch_rh(0.0f),
+  ch_rv(0.0f),
+  ch_lh(0.0f),
+  ch_lv(0.0f),
+  ch_lu(0.0f),
+  sw_r(DBusSwitchMode::MID),
+  sw_l(DBusSwitchMode::MID),
+  huart_(huart),
+  use_dma_(use_dma),
+  has_read_(false)
 {
 }
 
@@ -38,10 +47,9 @@ void DBus::request()
 
 void DBus::update(uint16_t size, uint32_t stamp_ms)
 {
+  ++rx_events;
+  last_size = size;
   if (size != DBUS_BUFF_SIZE) return;
-
-  has_read_ = true;
-  last_read_ms_ = stamp_ms;
 
   // 遥控器解析
   float ch_rh = get_stick((buff_[0] | (buff_[1] << 8)) & 0x07ff);
@@ -71,6 +79,12 @@ void DBus::update(uint16_t size, uint32_t stamp_ms)
   if (std::abs(mouse_vx) > 1 || std::abs(mouse_vy) > 1 || std::abs(mouse_vs) > 1) return;
 
   /// 更新公有属性
+
+  // 走到这里才算一帧有效数据; 长度对但内容乱的 (波特率/校验/反相不对) 不算,
+  // 否则 is_alive 会误判成"遥控器在线", 底盘拿一堆随机数去跑。
+  has_read_ = true;
+  last_read_ms_ = stamp_ms;
+  ++rx_frames;
 
   // 遥控器
   this->ch_rh = ch_rh;
@@ -110,7 +124,8 @@ void DBus::update(uint16_t size, uint32_t stamp_ms)
 }
 
 bool DBus::is_open() const { return has_read_; }
-
 bool DBus::is_alive(uint32_t now_ms) const { return is_open() && (now_ms - last_read_ms_ < 100); }
+
+void DBus::on_error() { ++rx_errors; }
 
 }  // namespace sp
