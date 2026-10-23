@@ -191,6 +191,14 @@ constexpr bool plot_name_fits(const char (&)[N])
   return N <= PLOT_MAX_NAME;
 }
 
+// Smallest power of two that is at least 2 * topics: the open-addressed index
+// in TopicTable is sized with it so the load factor stays at or below 1/2 and
+// an empty entry always terminates a probe sequence.
+constexpr int plot_index_size(int topics, int size = 1)
+{
+  return size >= 2 * topics ? size : plot_index_size(topics, size * 2);
+}
+
 struct PlotSlot
 {
   char name[PLOT_MAX_NAME];
@@ -488,7 +496,19 @@ public:
   }
 
 private:
+  // Open-addressed index over topics_: slot index + 1, 0 means empty. Lookups
+  // by name go through here instead of scanning every slot, so record() costs
+  // O(1) instead of O(registered topics) -- a 1 kHz task writing ~100 topics
+  // was spending most of its tick in the linear scan.
+  //
+  // Sized to twice the slot count so the load factor never exceeds 1/2 and a
+  // probe sequence is guaranteed to hit an empty entry. Topics are only ever
+  // appended, never removed, so no tombstones are needed.
+  static constexpr int kIndexSize = plot_index_size(kMaxTopics);
+  static_assert(kMaxTopics <= 255, "slot index + 1 must fit in the u8 index entry");
+
   PlotSlot topics_[kMaxTopics]{};
+  uint8_t index_[kIndexSize]{};
   volatile int count_ = 0;
   int sample_cursor_ = 0;
   PlotMatrixSlot matrices_[PLOT_MAX_MATRICES]{};
@@ -515,18 +535,26 @@ private:
     if (unlock_ != nullptr) unlock_(state);
   }
 
+  // Walks the probe sequence from the hash. The table is at most half full, so
+  // this always stops at an empty entry. Registration runs under the lock and
+  // writes the slot before publishing its index entry, so a reader that sees a
+  // non-zero entry is looking at a slot whose name is already complete.
   PlotSlot * lookup(const char * name, uint16_t hash)
   {
     if (name == nullptr) return nullptr;
-    const int n = count_;
-    for (int i = 0; i < n; ++i) {
-      if (topics_[i].hash == hash && std::strcmp(topics_[i].name, name) == 0) return &topics_[i];
+    int i = hash & (kIndexSize - 1);
+    for (;;) {
+      const uint8_t entry = index_[i];
+      if (entry == 0) return nullptr;
+      PlotSlot & slot = topics_[entry - 1];
+      if (slot.hash == hash && std::strcmp(slot.name, name) == 0) return &slot;
+      i = (i + 1) & (kIndexSize - 1);
     }
-    return nullptr;
   }
 
-  // Appends a slot. The name is fully written before the slot becomes visible
-  // through count_, so a reader either misses the topic or sees it complete.
+  // Appends a slot and links it into the index. The name is fully written
+  // before the slot becomes visible through count_ or the index, so a reader
+  // either misses the topic or sees it complete.
   // A name that does not fit is rejected rather than truncated: truncation
   // could merge two distinct paths into one field.
   PlotSlot * insert(const char * name, uint16_t hash, PlotUnit unit)
@@ -534,13 +562,21 @@ private:
     if (name == nullptr || name[0] == '\0' || count_ >= kMaxTopics) return nullptr;
     const size_t len = std::strlen(name);
     if (len >= static_cast<size_t>(PLOT_MAX_NAME)) return nullptr;
-    PlotSlot & slot = topics_[count_];
+
+    int pos = hash & (kIndexSize - 1);
+    while (index_[pos] != 0) pos = (pos + 1) & (kIndexSize - 1);
+
+    const int id = count_;
+    PlotSlot & slot = topics_[id];
     std::memset(&slot, 0, sizeof slot);
     std::memcpy(slot.name, name, len + 1);
     slot.hash = hash;
     slot.unit = unit;
     SP_PLOT_BARRIER();
-    count_ = count_ + 1;
+    count_ = id + 1;
+    SP_PLOT_BARRIER();
+    // Published last: this is what makes the topic findable by name.
+    index_[pos] = static_cast<uint8_t>(id + 1);
     return &slot;
   }
 
@@ -600,13 +636,12 @@ private:
     return -1;
   }
 
-  int find(const char * name) const
+  int find(const char * name)
   {
     const uint16_t hash = name_hash(name);
-    for (int i = 0; i < count_; ++i) {
-      if (topics_[i].hash == hash && std::strcmp(topics_[i].name, name) == 0) return i;
-    }
-    return -1;
+    const PlotSlot * slot = lookup(name, hash);
+    // Slot order is the wire id, so the index is the distance from the base.
+    return slot == nullptr ? -1 : static_cast<int>(slot - topics_);
   }
 
   void apply(uint8_t op, const char * name)
