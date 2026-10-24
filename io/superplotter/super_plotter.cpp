@@ -6,13 +6,11 @@ namespace sp
 {
 namespace
 {
-// Set by the SuperPlotter constructor. Global because record() is a static
-// entry point that has no instance to work with.
+// 由构造函数赋值. record() 是静态入口, 拿不到实例, 只能走这个全局指针.
 SuperPlotter * g_instance = nullptr;
 
-// Registration happens at most kMaxTopics times over the life of the program,
-// so masking interrupts here is cheap. PRIMASK is saved and restored so this
-// nests correctly inside another critical section.
+// 注册在程序生命周期里最多发生 kMaxTopics 次, 所以这里关中断很便宜.
+// 保存并恢复 PRIMASK, 以便在别的临界区里安全嵌套.
 uint32_t plot_lock()
 {
   const uint32_t primask = __get_PRIMASK();
@@ -32,12 +30,10 @@ SuperPlotter::SuperPlotter(
 {
   table_.set_lock(&plot_lock, &plot_unlock);
   g_instance = this;
-  // Cycle counter used to time a transmit. Only diagnostics: it separates a
-  // slow UART from a starved task when the frame rate is wrong.
+  // 打开 DWT 周期计数器, 用来量一帧的线上时间.
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-  // Start the "time since the last frame" clock at the constructor rather than
-  // at zero, otherwise the first samples would report the whole uptime.
+  // pl/tx_age 的起点定在构造时, 否则第一拍会把整段上电时间报成卡顿.
   tx_done_ms_ = HAL_GetTick();
 }
 
@@ -84,16 +80,12 @@ void SuperPlotter::flush()
   poll();
   if (huart_ == nullptr) return;
 
-  // One frame at a time: tx_ has been handed to the UART and cannot be filled
-  // again until the completion interrupt retires it.
+  // 同一时刻只允许一帧在飞.
   if (tx_busy_) {
-    // The HAL sets gState back to READY before it calls the completion
-    // callback, and a task cannot run in between because the callback is in
-    // the same interrupt. So seeing it ready here means the transfer ended on
-    // an error path that never reported completion. A 50 byte frame needs
-    // 0.6 ms; still busy after 10 ms means the interrupt was lost. Either way
-    // drop the frame and let the next flush retry, rather than stop plotting
-    // for the rest of the run.
+    // HAL 会在调完成回调之前把 gState 置回 READY, 而回调是中断、任务插不进去,
+    // 所以这里看到 READY 说明那次传输走了错误路径、没报完成. 44 字节一帧只要
+    // 0.48 ms, 10 ms 还没完就是中断丢了. 两种情况都丢掉这一帧让下一拍重试,
+    // 而不是让绘图从此停掉.
     if (huart_->gState == HAL_UART_STATE_READY) {
       tx_busy_ = false;
       tx_announce_ = 0;
@@ -109,27 +101,23 @@ void SuperPlotter::flush()
   }
   if (huart_->gState != HAL_UART_STATE_READY) return;
 
-  // Names are sent one per flush. A single ~180-byte name dump was truncated
-  // on this link; one name is at most 22 bytes (a 15 character matrix path plus
-  // rows, cols and the unit).
+  // 名字一次只发一个. 之前一次发整批约 180 字节, 在这条链路上被截断过;
+  // 单个名字最长 22 字节 (15 字符矩阵路径加行列和单位).
   constexpr size_t kAnnounceBurst = 24;
-  // 8 values is 44 bytes, 0.48 ms on the wire, so at a 1 ms period the link
-  // is half used and there is room for the adapter between frames. 16 values
-  // would use 91% of the wire and overrun it.
+  // 8 个值 = 44 字节 = 线上 0.48 ms, 1 ms 周期下链路占一半, 帧之间还有余量给
+  // 适配器. 16 个值会占到 91%, 链路撑不住.
   constexpr size_t kSampleBurst = 3 + 5 * 8 + 1;
 
   const size_t announced = table_.pop_announce(tx_, kAnnounceBurst);
   if (announced > 0) {
-    // Stored before the transfer starts so the completion interrupt, which
-    // may run before send_bytes() returns, always sees it.
+    // 先存下来再启动传输: 完成中断可能在 send_bytes() 返回前就进来.
     tx_announce_ = announced;
     if (!send_bytes(tx_, static_cast<uint16_t>(announced))) tx_announce_ = 0;
     return;
   }
 
-  // Matrices go out on their own, slower grid. If one is due, it takes this
-  // flush's frame and the scalars wait one tick; a matrix frame is much larger
-  // than a scalar frame, so mixing the two would need a bigger tx buffer.
+  // 矩阵走自己的慢节拍. 到期时它占这一拍的帧, 标量等下一拍;
+  // 矩阵帧大得多, 混在同一帧里需要更大的缓冲.
   const uint32_t now = osKernelSysTick();
   if (now - last_matrix_ms_ >= matrix_period_ms_) {
     const size_t packed = table_.pop_matrix_sample(tx_, PLOT_TX_SIZE);
@@ -148,8 +136,7 @@ void SuperPlotter::initialize() { request(); }
 
 void SuperPlotter::loop(TickFn record_hook)
 {
-  // Fixed grid, so a hook that occasionally takes longer does not push the
-  // sample rate around; the next tick is scheduled from wake, not from now.
+  // 固定节拍: 从醒来的时刻排下一次, 偶尔超时的钩子不会把采样率推走.
   uint32_t wake = osKernelSysTick();
   uint32_t iterations = 0;
 
@@ -157,9 +144,8 @@ void SuperPlotter::loop(TickFn record_hook)
     ++iterations;
     for (int i = 0; i < row_count_; ++i) rows_[i].pub.set(rows_[i].read());
 
-    // Matrices are sampled every tick like scalars; flush() decides how often
-    // they go on the wire. The buffer is per loop so a fill() that fails to
-    // write every cell cannot leak out of the frame that is due.
+    // 矩阵和标量一样每拍采样, 由 flush() 决定多久发一次. 缓冲在循环里声明,
+    // 某个 fill() 少写了格子也不会漏进要发的那一帧.
     if (matrix_row_count_ > 0) {
       float cells[PLOT_MATRIX_MAX_CELLS];
       for (int i = 0; i < matrix_row_count_; ++i) {
@@ -168,34 +154,21 @@ void SuperPlotter::loop(TickFn record_hook)
       }
     }
 
-    // Plotter self-diagnostics: together they say whether a missing curve is
-    // the link losing frames (tx_fail), the wire being saturated (tx_us vs the
-    // loop tick) or the loop itself falling behind (loop).
+    // 自诊断, 三条一起看: 曲线没了是链路丢帧 (tx_fail)、链路塞满
+    // (tx_us 对上一个周期) 还是循环本身落后 (loop).
     record_runtime("pl/tx_fail", static_cast<float>(tx_fail_));
     record_runtime("pl/tx_us", static_cast<float>(last_tx_us_));
     record_runtime("pl/tx_max", static_cast<float>(max_tx_us_));
     record_runtime("pl/loop", static_cast<float>(iterations & 0xFFFFFFu));
-    // Registered slots and how many of them the host asked for. The two
-    // together turn "the curve stopped" into a diagnosis: `pl/topics` stuck at
-    // PLOT_MAX_TOPICS means insert() silently dropped the rest (RAM/id limit),
-    // while `pl/subs` climbing past what the wire can carry shows up as each
-    // topic updating slower (kSampleBurst values per frame, one frame per tick).
+    // 已注册槽数和主机勾选数. pl/topics 卡在 PLOT_MAX_TOPICS 说明 insert()
+    // 把后面的静默丢了; pl/subs 超出链路能不能带走, 表现为每路刷新变慢.
     record_runtime("pl/topics", static_cast<float>(table_.size()));
     record_runtime("pl/subs", static_cast<float>(table_.subscribed_count()));
 
-    // Time since the last frame actually left the wire, in ms. This is the
-    // direct measure of "the plot task was not serviced": at period_ms = 1 it
-    // sits at 0..1, and every stall shows up as a spike of exactly the length
-    // of the stall. pl/tx_age_max keeps the worst one since boot, so a gap that
-    // already passed is still visible afterwards.
-    //
-    // Reading it: a spike with pl/tx_fail flat is the task being starved (CPU,
-    // not the link); a spike with pl/tx_fail climbing is a frame that never
-    // completed and had to be dropped. If both stay at 0 and the dashboard
-    // still stutters, the plotter is not the one losing the frames.
-    //
-    // Resolution is the 1 ms HAL tick, so sub-millisecond detail is the same
-    // 0/1 as the sample period; it is sized for stalls, not for jitter.
+    // 距上一帧真正发出去过了多少 ms, 直接量"绘图任务多久没被调度".
+    // 尖峰配 pl/tx_fail 不动 = 任务被抢占 (CPU 问题); 配 tx_fail 上涨 = 那一帧
+    // 没发完被丢了 (链路问题). 两者都是 0 而上位机还在卡, 就不是绘图器的问题.
+    // 分辨率是 1 ms 的 HAL 节拍, 用来抓卡顿而不是看抖动.
     const uint32_t age_ms = HAL_GetTick() - tx_done_ms_;
     if (age_ms > max_tx_age_ms_) max_tx_age_ms_ = age_ms;
     record_runtime("pl/tx_age", static_cast<float>(age_ms), PlotUnit::Millisecond);
@@ -228,13 +201,12 @@ void SuperPlotter::on_rx(uint16_t size)
   }
 }
 
-// Queues a frame and returns: the bytes leave in the UART interrupt, so the
-// 1 kHz plot loop costs microseconds instead of the ~0.5 ms a 44 byte frame
-// needs on the wire. tx_ stays valid until on_tx_complete().
+// 把一帧交给 UART 就返回: 字节在中断里发出, 所以 1 kHz 的循环只花几微秒,
+// 而不是一帧 44 字节在线上需要的 0.5 ms. tx_ 一直有效到 on_tx_complete().
 bool SuperPlotter::send_bytes(const uint8_t * data, uint16_t size)
 {
   if (huart_ == nullptr || data == nullptr || size == 0) return false;
-  // Set before the call: the first interrupt can fire inside it.
+  // 调用之前就置位: 第一个中断可能在调用内部就进来.
   tx_busy_ = true;
   tx_start_cycles_ = DWT->CYCCNT;
   const HAL_StatusTypeDef status =
@@ -252,18 +224,15 @@ void SuperPlotter::on_tx_complete()
 {
   if (huart_ == nullptr) return;
   if (tx_busy_) {
-    // The CPU was free for the whole transfer, so this measures the wire time
-    // (bytes * 10 bits / baud), not the cost of plotting.
+    // 整个传输期间 CPU 是空闲的, 所以这里量到的是线上时间, 不是绘图的 CPU 开销.
     const uint32_t cycles = DWT->CYCCNT - tx_start_cycles_;
     last_tx_us_ = cycles / (SystemCoreClock / 1000000u);
     if (last_tx_us_ > max_tx_us_) max_tx_us_ = last_tx_us_;
-    // Timestamp for pl/tx_age. HAL_GetTick() only reads the SysTick counter, so
-    // it is safe here in the completion interrupt, and it does not wrap for
-    // 49 days -- the DWT cycle counter it could have used wraps in 8.9 s.
+    // pl/tx_age 的时间戳. HAL_GetTick() 只读 SysTick, 在完成中断里是安全的,
+    // 而且 49 天才回绕, 不像 DWT 周期计数器 8.9 秒就绕一圈.
     tx_done_ms_ = HAL_GetTick();
-    // Announcements are only marked sent now that the bytes are actually out:
-    // a frame that is aborted or half sent is retried instead of leaving the
-    // host with a torn name.
+    // 名字公告要等字节真的发出去才标记: 中途被打断的帧会重试, 而不是让主机
+    // 看到一个残缺的名字.
     if (tx_announce_ != 0) {
       table_.commit_announce(tx_announce_);
       tx_announce_ = 0;

@@ -5,35 +5,29 @@
 #include <cstdint>
 #include <cstring>
 
-// Wire format for sp::SuperPlotter: named topics, subscription only. Not NetworkTables.
+// sp::SuperPlotter 的线上格式: 命名主题, 只发被订阅的. (不是 NetworkTables)
 //
-// Board -> host  AA BC | id u8 | name, NUL | unit u8   once per topic, when first flushed
-// Host  -> board AA BD | op u8 | name, NUL          1 sub, 2 unsub, 3 all, 4 clear
-// Board -> host  AA BB | count u8 | (id u8, f32le)* | xor u8
-//                xor covers every preceding byte. A frame that fails it is dropped.
+// 板 -> 主机  AA BC | id u8 | name, NUL | unit u8                  每个主题在首次 flush 时发一次
+// 主机 -> 板  AA BD | op u8 | name, NUL                           1 订阅 2 退订 3 全订阅 4 清空
+// 板 -> 主机  AA BB | count u8 | (id u8, f32le)* | xor u8          标量样本
+//                   xor 覆盖前面所有字节, 校验失败的帧整帧丢弃.
 //
-// Matrices are a second frame family, because a 24-byte scalar slot cannot hold
-// a variable number of cells:
+// 矩阵是第二组帧: 24 字节的标量槽位放不下可变数量的格子.
 //
-// Board -> host  AA BE | id u8 | rows u8 | cols u8 | name, NUL | unit u8
-// Board -> host  AA BF | count u8 | (id u8, rows u8, cols u8, f32le[rows*cols])* | xor u8
+// 板 -> 主机  AA BE | id u8 | rows u8 | cols u8 | name, NUL | unit u8
+// 板 -> 主机  AA BF | count u8 | (id u8, rows u8, cols u8, f32le[rows*cols])* | xor u8
 //
-// Cells are row-major. rows and cols are repeated in every sample frame so a
-// host that missed an announcement can still parse the payload. Subscriptions
-// are the same AA BD names as scalars; a name belongs to one of the two tables.
+// 格子按行优先. rows/cols 在每个样本帧里重复, 这样漏了公告的主机也能解析.
+// 订阅用的还是同一套 AA BD 名字, 一个名字只属于两张表之一.
 //
-// The unit is one byte from PlotUnit, sent right after the name: a label for
-// the host's axis, not a conversion. The value is always transmitted in the
-// unit it was recorded in. Adding it costs one byte per topic, once.
+// unit 是 PlotUnit 的一个字节, 紧跟名字发送: 只是主机坐标轴的标签, 不做换算,
+// 数值始终按记录时的单位发出. 每个主题只多花一个字节, 而且只发一次.
 //
-// Registered topics and transmitted values are separate limits. A topic costs
-// RAM only until the host subscribes to it; the frame is built from the
-// subscribed subset and split when it does not fit in one frame, so the number
-// of registered topics is bounded by RAM and the u8 id space, not by a frame.
+// "注册的主题数"和"发送的值数"是两个独立的限制. 一个主题在主机订阅之前只占 RAM;
+// 帧由被订阅的子集拼成, 装不下就拆成多帧, 所以注册数只受 RAM 和 u8 id 空间限制.
 //
-// Paths are limited to 15 characters (PLOT_MAX_NAME = 16 including the NUL).
-// SuperPlotter::record() and sp::record() only accept literals and reject an
-// over-long one at compile time; nothing is ever truncated at runtime.
+// 路径最长 15 字符 (PLOT_MAX_NAME = 16, 含结尾 NUL). SuperPlotter::record()
+// 只接受字面量, 超长的在编译期就报错, 运行期永不截断.
 
 #if defined(__GNUC__)
 #define SP_PLOT_BARRIER() __asm volatile("" ::: "memory")
@@ -41,18 +35,15 @@
 #define SP_PLOT_BARRIER() ((void)0)
 #endif
 
-// How many topics can be registered at once. Bounded by the u8 id space (255)
-// and by RAM: each slot is 24 bytes, so 128 slots cost 3 KB.
-// Override with -DSP_PLOT_MAX_TOPICS=<n> if the board needs another number.
+// 最多注册多少个主题. 受 u8 id 空间 (255) 和 RAM 限制: 每槽 24 字节, 128 槽约 3 KB.
+// 板子需要别的数时用 -DSP_PLOT_MAX_TOPICS=<n> 覆盖.
 #ifndef SP_PLOT_MAX_TOPICS
 #define SP_PLOT_MAX_TOPICS 128
 #endif
 
-// Matrices are stored separately from scalar topics: a matrix slot holds the
-// whole cell block, so a bigger PLOT_MATRIX_CELLS multiplies RAM. 8 slots of
-// 32 cells cost about 1.2 KB. One frame carries at most 32 floats, which is
-// 135 bytes and fits in PLOT_TX_SIZE. Override with -DSP_PLOT_MAX_MATRICES=<n>
-// and -DSP_PLOT_MATRIX_CELLS=<n> if the board can afford more.
+// 矩阵和标量分开存: 矩阵槽位装整块格子, 所以 PLOT_MATRIX_CELLS 直接乘 RAM.
+// 8 槽 × 32 格约 1.2 KB. 一帧最多 32 个 float (135 字节), 放得进 PLOT_TX_SIZE.
+// 板子扛得住就用 -DSP_PLOT_MAX_MATRICES=<n> / -DSP_PLOT_MATRIX_CELLS=<n> 覆盖.
 #ifndef SP_PLOT_MAX_MATRICES
 #define SP_PLOT_MAX_MATRICES 8
 #endif
@@ -68,62 +59,58 @@ constexpr uint8_t PLOT_OP_ALL = 3;
 constexpr uint8_t PLOT_OP_CLEAR = 4;
 
 constexpr int PLOT_MAX_TOPICS = SP_PLOT_MAX_TOPICS;
-constexpr int PLOT_MAX_NAME = 16;  // 15 characters plus the NUL
+constexpr int PLOT_MAX_NAME = 16;  // 15 个字符加结尾 NUL
 constexpr int PLOT_MAX_ID = 255;
 
-// Unit label carried by an announcement. One byte on the wire and one byte in
-// the slot, so a topic still costs 24 bytes. The ids are part of the protocol:
-// the host keeps the same table, so never renumber an existing entry -- add new
-// ones at the end.
+// 公告里带的单位标签. 线上一个字节、槽位里也一个字节, 主题仍然只占 24 字节.
+// id 是协议的一部分: 主机用的是同一张表, 所以已有的编号绝不能改, 新单位只能往后加.
 //
-// Only units the dashboard can actually convert are listed. A quantity with no
-// group there (torque in N*m, mass in kg, power in W ...) should be recorded
-// with PlotUnit::None: a label the host cannot resolve is worse than no label,
-// because it looks like the axis was handled.
+// 只列上位机真能换算的单位. 它没有对应单位组的量 (力矩 N·m、质量 kg、功率 W ...)
+// 请用 PlotUnit::None: 挂一个主机解析不了的标签比没有标签更糟, 因为看起来像是
+// 轴已经处理过了.
 //
-// None means "unknown or dimensionless"; the host shows the field without a
-// unit instead of guessing one from the path.
+// None 表示"未知或无量纲", 主机会直接不显示单位, 而不是从路径里猜一个.
 enum class PlotUnit : uint8_t
 {
   None = 0,
 
-  // length
+  // 长度
   Meter = 1,
   Millimeter = 2,
   Centimeter = 3,
   Inch = 4,
   Foot = 5,
 
-  // angle
+  // 角度
   Radian = 6,
   Degree = 7,
   Revolution = 8,
 
-  // time
+  // 时间
   Second = 9,
   Millisecond = 10,
   Microsecond = 11,
   Minute = 12,
 
-  // linear
+  // 线速度/加速度
   MeterPerSecond = 13,
   MeterPerSecondSquared = 14,
 
-  // angular
+  // 角速度/角加速度
   RadianPerSecond = 15,
   DegreePerSecond = 16,
   RadianPerSecondSquared = 17,
 
-  // electrical
+  // 电学
   Ampere = 18,
   Volt = 19,
   Joule = 20,
 
-  // thermal
+  // 温度
   Celsius = 21,
   Kelvin = 22,
 
-  // misc
+  // 其他
   Hertz = 23,
   RevolutionPerMinute = 24,
 };
@@ -133,9 +120,8 @@ constexpr int PLOT_UNIT_COUNT = 25;
 constexpr int PLOT_MAX_MATRICES = SP_PLOT_MAX_MATRICES;
 constexpr int PLOT_MATRIX_MAX_CELLS = SP_PLOT_MATRIX_CELLS;
 
-// A matrix slot owns its cells: publishing copies them, so a caller may pass a
-// stack buffer that goes away. Rows and cols are fixed by the first
-// registration, like the unit.
+// 矩阵槽位自己持有格子: 发布时拷贝, 所以调用方可以传一个马上失效的栈缓冲.
+// 行列和单位一样, 由第一次注册固定.
 struct PlotMatrixSlot
 {
   char name[PLOT_MAX_NAME];
@@ -150,7 +136,7 @@ struct PlotMatrixSlot
 class MatrixPublisher
 {
 public:
-  // `values` must hold rows * cols floats in row-major order.
+  // values 必须是 rows*cols 个 float, 行优先.
   void set(const float * values) const
   {
     if (slot_ == nullptr || values == nullptr) return;
@@ -168,8 +154,7 @@ private:
   PlotMatrixSlot * slot_ = nullptr;
 };
 
-// One row of a matrix table polled on a fixed cadence. `fill` writes
-// rows * cols floats in row-major order into the provided buffer.
+// 按固定节拍轮询的矩阵表中的一行. fill 把 rows*cols 个 float 按行优先写进缓冲.
 struct PolledMatrix
 {
   const char * name;
@@ -180,20 +165,18 @@ struct PolledMatrix
   MatrixPublisher pub;
 };
 
-// True when a literal path fits in PlotSlot::name (N includes the NUL).
-// Paths shorter than 15 characters bind to the const char (&)[N] overloads of
-// SuperPlotter::record() / publish(), which static_assert this. Runtime names
-// are only used by internal tables that already checked their literals, and
-// insert() rejects an over-long one instead of truncating it.
+// 字面量路径能放进 PlotSlot::name 时返回 true (N 含 NUL).
+// 15 字符以内的路径会绑定到 SuperPlotter::record() / publish() 的
+// const char (&)[N] 重载, 那里 static_assert 这个条件. 运行期名字只有内部表会用,
+// 那些表的字面量已经检查过, 而且 insert() 会拒收超长的而不是截断.
 template <size_t N>
 constexpr bool plot_name_fits(const char (&)[N])
 {
   return N <= PLOT_MAX_NAME;
 }
 
-// Smallest power of two that is at least 2 * topics: the open-addressed index
-// in TopicTable is sized with it so the load factor stays at or below 1/2 and
-// an empty entry always terminates a probe sequence.
+// 不小于 2*topics 的最小 2 的幂: TopicTable 的开放寻址索引按它开, 保证装载率
+// 不超过 1/2, 探测序列一定能撞到空槽.
 constexpr int plot_index_size(int topics, int size = 1)
 {
   return size >= 2 * topics ? size : plot_index_size(topics, size * 2);
@@ -205,12 +188,11 @@ struct PlotSlot
   float value;
   uint16_t hash;
   PlotUnit unit;
-  // Bit 0 subscribed, bit 1 announced. Packed so the whole slot stays 24 bytes:
-  // 16 + 4 + 2 + 1 + 1.
+  // bit0 已订阅, bit1 已公告. 这样打包整个槽位正好 24 字节: 16 + 4 + 2 + 1 + 1.
   uint8_t flags;
 };
 
-// The unit byte must not cost RAM: keep it in the same 24-byte slot as before.
+// 单位那一字节不能涨 RAM: 槽位必须还是 24 字节.
 static_assert(sizeof(PlotSlot) == 24, "PlotSlot grew; check the field packing");
 
 constexpr uint8_t PLOT_SLOT_SUBSCRIBED = 1u << 0;
@@ -231,10 +213,9 @@ private:
   PlotSlot * slot_ = nullptr;
 };
 
-// One row of a table polled on a fixed cadence: a path, the value it should
-// read, and the publisher handle that was registered for it. Kept here rather
-// than in super_plotter.hpp so the host-side bridge can share the table type
-// without pulling in the HAL.
+// 按固定节拍轮询的标量表中的一行: 路径、读值的函数、注册好的发布句柄.
+// 放在这里而不是 super_plotter.hpp, 是为了让主机侧的桥接程序能共用表类型
+// 又不必引入 HAL.
 struct PolledRow
 {
   const char * name;
@@ -248,9 +229,8 @@ class TopicTable
 public:
   static constexpr int kMaxTopics = PLOT_MAX_TOPICS;
 
-  // Called only while a topic is being registered, so record() on an already
-  // known topic stays lock-free. Leave unset on a single threaded build.
-  // The lock returns an opaque state that the unlock restores.
+  // 只在注册主题时调用, 所以已知主题上的 record() 是无锁的.
+  // 单线程构建可以不设. lock 返回一个不透明状态, 由 unlock 还原.
   using LockFn = uint32_t (*)();
   using UnlockFn = void (*)(uint32_t);
 
@@ -276,12 +256,11 @@ public:
     return out;
   }
 
-  // Writes one value, registering the topic the first time the name is seen.
-  // Safe to call from any task: the cold path is serialized, the hot path is
-  // a hash compare plus a single float store.
+  // 写一个值, 名字第一次出现时注册主题. 任意任务可调: 冷路径串行化,
+  // 热路径只是一次哈希比对加一次 float 存储.
   //
-  // The unit only matters on the registering call; a later call with a
-  // different unit is ignored, so one topic never changes its label mid-run.
+  // 单位只在注册那一次有效, 之后用不同单位调用会被忽略, 所以一个主题
+  // 不会在运行中途换标签.
   void record(const char * name, float value, PlotUnit unit = PlotUnit::None)
   {
     if (name == nullptr || name[0] == '\0') return;
@@ -298,9 +277,8 @@ public:
     unlock(state);
   }
 
-  // Registers a matrix topic and returns a handle. Publishing copies the cells,
-  // so the caller can reuse its buffer. Both dimensions must be non-zero and
-  // rows * cols must fit in PLOT_MATRIX_MAX_CELLS.
+  // 注册一个矩阵主题并返回句柄. 发布时拷贝格子, 所以调用方可以复用缓冲.
+  // 行列都必须非 0, 且 rows*cols 不能超过 PLOT_MATRIX_MAX_CELLS.
   MatrixPublisher publish_matrix(
     const char * name, uint8_t rows, uint8_t cols, PlotUnit unit = PlotUnit::None)
   {
@@ -318,9 +296,8 @@ public:
     return out;
   }
 
-  // Registers on the first call, then copies the cells. An existing topic keeps
-  // its shape: a call with different dimensions is ignored rather than writing
-  // past the slot or silently reinterpreting the data.
+  // 第一次调用时注册, 之后拷格子. 已存在的主题保持原形状: 用不同尺寸调用会被
+  // 忽略, 而不是写越界或者悄悄换一种解读.
   void record_matrix(
     const char * name, uint8_t rows, uint8_t cols, const float * values,
     PlotUnit unit = PlotUnit::None)
@@ -337,9 +314,8 @@ public:
     }
   }
 
-  // Packs as many pending announcements as fit in dst. Does not mark them
-  // sent: commit_announce() does that after the bytes have actually gone out,
-  // so a transmit that is cut short is retried instead of forgotten.
+  // 把待发的公告尽量塞进 dst. 不标记已发: 等字节真的出去了再由
+  // commit_announce() 标记, 这样被截断的帧会重试而不是遗忘.
   size_t pop_announce(uint8_t * dst, size_t cap)
   {
     if (dst == nullptr) return 0;
@@ -358,8 +334,7 @@ public:
       total += need;
     }
 
-    // Matrices follow the scalars. The id spaces are separate on the wire, so
-    // the slot index is used as-is.
+    // 矩阵公告排在标量后面. 线上两套 id 空间是独立的, 所以槽位下标直接用.
     const int matrix_n = matrix_count_;
     for (int i = 0; i < matrix_n; ++i) {
       if (matrices_[i].name[0] == '\0' || (matrices_[i].flags & PLOT_SLOT_ANNOUNCED)) continue;
@@ -378,8 +353,8 @@ public:
     return total;
   }
 
-  // Marks the announcements packed by the last pop_announce() of `n` bytes.
-  // `n` must be a prefix of what pop_announce() just wrote.
+  // 把上一次 pop_announce() 打包的 n 个字节标记为已发.
+  // n 必须是那次写出的前缀长度.
   void commit_announce(size_t n)
   {
     size_t total = 0;
@@ -402,8 +377,8 @@ public:
     }
   }
 
-  // Packs subscribed topics into one frame, resuming at the cursor so a set
-  // larger than one frame is sent over consecutive calls instead of dropped.
+  // 把已订阅的标量拼成一帧, 从上次的游标继续, 所以超过一帧的集合会分几次发
+  // 而不是被丢掉.
   size_t pop_sample(uint8_t * dst, size_t cap)
   {
     if (dst == nullptr || cap < 9) return 0;
@@ -439,10 +414,8 @@ public:
     return total;
   }
 
-  // Packs subscribed matrices into one AA BF frame. Each entry repeats rows and
-  // cols: a host that missed the announcement can still parse the payload, and
-  // a re-registered topic with new dimensions cannot desynchronise the parser.
-  // The cursor makes a set that does not fit span several frames.
+  // 把已订阅的矩阵拼成一帧 AA BF. 每个条目重复 rows/cols: 漏了公告的主机也能
+  // 解析, 重新注册成新尺寸的主题也不会让解析器错位. 游标让装不下的集合分多帧发.
   size_t pop_matrix_sample(uint8_t * dst, size_t cap)
   {
     if (dst == nullptr || cap < 11) return 0;
@@ -496,14 +469,12 @@ public:
   }
 
 private:
-  // Open-addressed index over topics_: slot index + 1, 0 means empty. Lookups
-  // by name go through here instead of scanning every slot, so record() costs
-  // O(1) instead of O(registered topics) -- a 1 kHz task writing ~100 topics
-  // was spending most of its tick in the linear scan.
+  // topics_ 上的开放寻址索引: 存槽位下标 + 1, 0 表示空. 按名字查时走这里而不是
+  // 扫遍所有槽位, 所以 record() 是 O(1) 而不是 O(注册数) —— 之前 1 kHz 任务
+  // 写约 100 个主题时, 大部分时间都花在扫描上.
   //
-  // Sized to twice the slot count so the load factor never exceeds 1/2 and a
-  // probe sequence is guaranteed to hit an empty entry. Topics are only ever
-  // appended, never removed, so no tombstones are needed.
+  // 按槽位数的两倍开, 保证装载率不超过 1/2、探测序列一定撞到空槽.
+  // 主题只追加不删除, 所以不需要墓碑标记.
   static constexpr int kIndexSize = plot_index_size(kMaxTopics);
   static_assert(kMaxTopics <= 255, "slot index + 1 must fit in the u8 index entry");
 
@@ -535,10 +506,9 @@ private:
     if (unlock_ != nullptr) unlock_(state);
   }
 
-  // Walks the probe sequence from the hash. The table is at most half full, so
-  // this always stops at an empty entry. Registration runs under the lock and
-  // writes the slot before publishing its index entry, so a reader that sees a
-  // non-zero entry is looking at a slot whose name is already complete.
+  // 从哈希位置沿探测序列找. 表最多半满, 所以一定停在空槽上.
+  // 注册在锁里进行, 先写槽位再发布索引项, 所以读到非空索引项的线程看到的
+  // 一定是名字已经写完整的槽位.
   PlotSlot * lookup(const char * name, uint16_t hash)
   {
     if (name == nullptr) return nullptr;
@@ -552,11 +522,9 @@ private:
     }
   }
 
-  // Appends a slot and links it into the index. The name is fully written
-  // before the slot becomes visible through count_ or the index, so a reader
-  // either misses the topic or sees it complete.
-  // A name that does not fit is rejected rather than truncated: truncation
-  // could merge two distinct paths into one field.
+  // 追加一个槽位并挂进索引. 名字写完才让 count_ 和索引可见, 所以读者要么没看到
+  // 这个主题, 要么看到的是完整的. 放不下的名字直接拒收而不是截断 ——
+  // 截断会把两个不同的路径并成同一个字段.
   PlotSlot * insert(const char * name, uint16_t hash, PlotUnit unit)
   {
     if (name == nullptr || name[0] == '\0' || count_ >= kMaxTopics) return nullptr;
@@ -575,12 +543,12 @@ private:
     SP_PLOT_BARRIER();
     count_ = id + 1;
     SP_PLOT_BARRIER();
-    // Published last: this is what makes the topic findable by name.
+    // 最后发布: 这一步之后这个主题才能按名字查到.
     index_[pos] = static_cast<uint8_t>(id + 1);
     return &slot;
   }
 
-  // 3 header bytes, the name with its NUL, and the unit byte.
+  // 3 字节帧头 + 带 NUL 的名字 + 单位字节.
   static size_t announce_size(const PlotSlot & slot)
   {
     return 3 + std::strlen(slot.name) + 1 + 1;
@@ -621,7 +589,7 @@ private:
     return &slot;
   }
 
-  // 3 header bytes + rows + cols + the name with its NUL + the unit byte.
+  // 3 字节帧头 + rows + cols + 带 NUL 的名字 + 单位字节.
   static size_t matrix_announce_size(const PlotMatrixSlot & slot)
   {
     return 7 + std::strlen(slot.name);
@@ -640,7 +608,7 @@ private:
   {
     const uint16_t hash = name_hash(name);
     const PlotSlot * slot = lookup(name, hash);
-    // Slot order is the wire id, so the index is the distance from the base.
+    // 槽位顺序就是线上 id, 所以下标就是相对基址的距离.
     return slot == nullptr ? -1 : static_cast<int>(slot - topics_);
   }
 
@@ -649,7 +617,7 @@ private:
     if (op == PLOT_OP_ALL || op == PLOT_OP_CLEAR) {
       const uint8_t on = op == PLOT_OP_ALL ? PLOT_SLOT_SUBSCRIBED : 0;
       for (int i = 0; i < count_; ++i) {
-        // Force a re-announce so a host that just connected learns the units too.
+        // 强制重新公告, 好让刚连上的主机也拿到单位.
         topics_[i].flags = on;
       }
       for (int i = 0; i < matrix_count_; ++i) {
@@ -665,7 +633,7 @@ private:
       else if (op == PLOT_OP_UNSUB) topics_[id].flags &= static_cast<uint8_t>(~PLOT_SLOT_SUBSCRIBED);
       return;
     }
-    // Scalar and matrix names share the subscribe namespace but not the table.
+    // 标量和矩阵共用订阅用的名字空间, 但不在同一张表里.
     const int matrix_id = find_matrix(name);
     if (matrix_id < 0) return;
     if (op == PLOT_OP_SUB) matrices_[matrix_id].flags |= PLOT_SLOT_SUBSCRIBED;
@@ -701,8 +669,8 @@ private:
       name[0] = '\0';
       if (op == PLOT_OP_SUB || op == PLOT_OP_UNSUB) {
         const int c = end - 3;
-        // A name that does not fit cannot match any registered topic (they are
-        // all shorter), so drop it instead of truncating it into a mismatch.
+        // 放不下的名字不可能匹配任何已注册主题 (它们都更短), 所以直接丢掉,
+        // 而不是截断成一个错误的名字.
         if (c <= 0 || c >= PLOT_MAX_NAME) {
           ++end;
           std::memmove(acc_, acc_ + end, static_cast<size_t>(acc_len_ - end));
