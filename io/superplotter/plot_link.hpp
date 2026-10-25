@@ -663,7 +663,17 @@ private:
       int end = 3;
       if (op == PLOT_OP_SUB || op == PLOT_OP_UNSUB) {
         while (end < acc_len_ && acc_[end] != 0) ++end;
-        if (end >= acc_len_) return;
+        if (end >= acc_len_) {
+          // 名字还没收完, 通常再等下一个字节就行. 但一帧最长只有
+          // 3 + (PLOT_MAX_NAME - 1) + 1 字节, 超过这个长度还没有 NUL, 说明帧头是假的:
+          // 要么线上是乱码 (波特率/线序不对), 要么上一帧被截断, 把数据当成了 header.
+          // 这时再等下去 acc_ 只会被填满, 然后 ingest() 开始丢新字节, 解析器就永久
+          // 卡在这个状态直到复位. 丢一个字节让 while 重新找 AA BD.
+          if (acc_len_ < 3 + PLOT_MAX_NAME) return;
+          std::memmove(acc_, acc_ + 1, static_cast<size_t>(acc_len_ - 1));
+          acc_len_ -= 1;
+          continue;
+        }
       }
       char name[PLOT_MAX_NAME];
       name[0] = '\0';

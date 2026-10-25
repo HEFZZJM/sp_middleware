@@ -6,6 +6,8 @@
 - **命名主题**：路径是一个字符串，不是数组下标，上位机按名字勾选。
 - **订阅制**：板上记录所有路径，但**只发送上位机勾选的那些**，串口带宽只取决于勾了几条。
 - **中断发送**：`flush()` 把一帧交给 UART 就返回，耗时几微秒。
+- **动态刷新率**：刷新的变量太多会把串口搞爆，如果勾选的变量超过 8 会把数据分成多帧发送。
+- **单位标识**：发送的变量可以带有单位标识，方便在上位机做归一化和单位换算。
 
 ## 用法
 
@@ -16,10 +18,7 @@ sp::SuperPlotter::record("arm/j0/pos", arm_j0.pos);              // 自动注册
 sp::SuperPlotter::record("arm/j0/vel", arm_j0.vel, sp::PlotUnit::RadianPerSecond);
 ```
 
-任意任务、任意位置都能调用：第一次调用时注册路径，之后每次只写一个 float，
-按 16 位哈希定位槽位，无锁、无内存分配。
-
-同一个量在热点循环里高频写时，用句柄形式省掉查表：
+同一个量高频写时，用句柄形式省掉查表（不过我试了一下没有好多少）：
 
 ```cpp
 sp::PlotPublisher j0 = plotter.publish("arm/j0/pos");   // 注册一次，返回句柄
@@ -39,8 +38,8 @@ sp::SuperPlotter::record_matrix("chassis/pos", 1, 3, xyz, sp::PlotUnit::Meter);
 
 | 项目 | 值 | 说明 |
 | --- | --- | --- |
-| 路径长度 | ≤ 15 字符 | 超长**编译报错**，不会截断（截断会把两个路径并成一个字段） |
-| 路径形式 | 字面量 | 运行期 `const char *` 不接受，长度必须编译期已知 |
+| 路径长度 | ≤ 15 字符 | 超长**编译报错** |
+| 路径形式 | 字面量 | 运行期长度必须编译期已知 |
 | 注册上限 | 128 个 | 每槽 24 字节，共约 3 KB；可用 `-DSP_PLOT_MAX_TOPICS=<n>` 改 |
 | 矩阵上限 | 8 个 × 32 格 | 可用 `-DSP_PLOT_MAX_MATRICES` / `-DSP_PLOT_MATRIX_CELLS` 改 |
 | 单帧标量 | 8 个值（44 字节） | 订阅数更多时分多帧轮流发，不丢数据，只是每路刷新变慢 |
@@ -69,15 +68,9 @@ sp::SuperPlotter::record_matrix("chassis/pos", 1, 3, xyz, sp::PlotUnit::Meter);
 板 -> 上位机  AA BF | count u8 | (id u8, rows, cols, f32le[r*c])* | xor u8   矩阵样本
 ```
 
-`xor` 覆盖前面所有字节，校验失败的帧整帧丢弃而不是画出一个毛刺。
-
-`unit` 是 `sp::PlotUnit` 的 id（0 = 无单位），一个字节，随名字一起只发一次。
-它只是给上位机坐标轴用的标签，**数值始终按记录时的单位原样发送**，不做换算。
-枚举放在 `plot_link.hpp`，id 是协议的一部分：新增只能往后加，不能改号。
-
-只列了 SuperScope 能真正换算的单位。力矩（N·m）、质量（kg）、功率（W）这类
-它没有对应单位组的量，请用 `PlotUnit::None`——挂一个上位机解析不了的标签，
-比没有标签更容易让人误以为轴已经处理好了。
+板侧的接收是一个字节级状态机：找不到 `AA BD` 就把最后那个 `AA` 留着等下一帧，其余丢掉。
+一条帧超过最大长度（3 + 15 + 1 字节）还没有名字结尾的 NUL，会被判成假帧头并丢一个字节
+重新找 `AA BD`——否则累积缓冲会被填满，解析器永久卡住。
 
 ## 接入
 
@@ -118,12 +111,9 @@ extern "C" void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart)
 }
 ```
 
-`initialize()` 还有一种接受轮询表的写法（`PolledRow` 数组），表里一行一个路径，
-由 `loop()` 按固定节拍采样。多数情况直接用 `record()` 更省事，不需要这张表。
-
 ## 自诊断
 
-绘图器自己会记录几个量，曲线不对时先看它们：
+绘图器自己会记录几个元数据，用于查错：
 
 | 路径 | 含义 |
 | --- | --- |
@@ -138,8 +128,3 @@ extern "C" void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart)
 
 `pl/tx_age` 出现尖峰时，`pl/tx_fail` 平 = 任务被抢占（CPU 问题）；
 `pl/tx_fail` 同时在涨 = 那一帧没发完被丢了（链路问题）。
-
-## 上位机
-
-配套的 SuperScope 在 `sp_plotter` 仓库，是 AdvantageScope 的改造版。
-连上后它先收公告建字段列表，再按界面上勾选的曲线发订阅帧，取消勾选就发退订帧。
